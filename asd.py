@@ -68,7 +68,8 @@ ES_USERNAME = os.getenv("ES_USERNAME")
 ES_PASSWORD = os.getenv("ES_PASSWORD")
 ES_API_KEY = os.getenv("ES_API_KEY")
 ES_CA_CERTS = os.getenv("ES_CA_CERTS")
-ES_VERIFY_CERTS = os.getenv("ES_VERIFY_CERTS", "true").lower() == "true"
+ES_DEFAULT_VERIFY_CERTS = "false" if ES_URL.lower().startswith("http://") else "true"
+ES_VERIFY_CERTS = os.getenv("ES_VERIFY_CERTS", ES_DEFAULT_VERIFY_CERTS).lower() == "true"
 ES_INDEX = os.getenv("ES_INDEX", "ai_docs_elasticsearch")
 ES_INSERT_BATCH_SIZE = int(os.getenv("ES_INSERT_BATCH_SIZE", "64"))
 ES_NUM_CANDIDATES = int(os.getenv("ES_NUM_CANDIDATES", "100"))
@@ -676,13 +677,16 @@ def ensure_qdrant_collection():
 
 def get_es_client():
     hosts = [x.strip() for x in ES_URL.split(",") if x.strip()]
+    use_https = any(host.lower().startswith("https://") for host in hosts)
 
     kwargs = {
         "request_timeout": ES_REQUEST_TIMEOUT,
-        "verify_certs": ES_VERIFY_CERTS,
     }
 
-    if ES_CA_CERTS:
+    if use_https:
+        kwargs["verify_certs"] = ES_VERIFY_CERTS
+
+    if use_https and ES_CA_CERTS:
         kwargs["ca_certs"] = ES_CA_CERTS
 
     if ES_API_KEY:
@@ -2299,6 +2303,8 @@ def health():
         "qdrant_collection": QDRANT_COLLECTION,
         "elasticsearch_index": ES_INDEX,
         "elasticsearch_num_candidates": ES_NUM_CANDIDATES,
+        "elasticsearch_url_scheme": ES_URL.split("://", 1)[0],
+        "elasticsearch_verify_certs": ES_VERIFY_CERTS,
         "embedding_dim": EMBEDDING_DIM,
         "halfvec_dim": HALFVEC_DIM,
         "embedding_batch_size": EMBEDDING_BATCH_SIZE,
