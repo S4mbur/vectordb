@@ -5,6 +5,8 @@ import uuid
 import time
 import logging
 import threading
+import json
+import re
 from array import array
 from typing import List, Dict, Any
 
@@ -90,8 +92,15 @@ MAX_CONTEXT_LENGTH = int(os.getenv("MAX_CONTEXT_LENGTH", "18000"))
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1800"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+CHUNK_MAX_WORDS = int(os.getenv("CHUNK_MAX_WORDS", "450"))
+CHUNK_OVERLAP_WORDS = int(os.getenv("CHUNK_OVERLAP_WORDS", "80"))
+CHUNK_MIN_WORDS = int(os.getenv("CHUNK_MIN_WORDS", "20"))
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "8"))
 UPLOAD_JOB_HISTORY_LIMIT = int(os.getenv("UPLOAD_JOB_HISTORY_LIMIT", "100"))
+RETRIEVAL_CANDIDATE_K = int(os.getenv("RETRIEVAL_CANDIDATE_K", "30"))
+ENABLE_LLM_RERANK = os.getenv("ENABLE_LLM_RERANK", "false").lower() == "true"
+RERANK_MAX_CANDIDATES = int(os.getenv("RERANK_MAX_CANDIDATES", str(RETRIEVAL_CANDIDATE_K)))
+RERANK_CHUNK_MAX_CHARS = int(os.getenv("RERANK_CHUNK_MAX_CHARS", "1200"))
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
 APP_PORT = int(os.getenv("APP_PORT", "8000"))
 APP_LOG_LEVEL = os.getenv("APP_LOG_LEVEL", "info")
@@ -225,12 +234,37 @@ def get_embedding(text: str) -> List[float]:
     return get_embeddings([text])[0]
 
 
-def ask_llm(question: str, context: str) -> str:
+def call_chat_model(system_prompt: str, user_prompt: str, timeout: int = 180) -> str:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {REMOTE_API_KEY}",
     }
 
+    payload = {
+        "model": REMOTE_CHAT_MODEL,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    resp = requests.post(
+        REMOTE_CHAT_URL,
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+    )
+
+    if resp.status_code != 200:
+        logger.error("Chat API error: %s - %s", resp.status_code, resp.text)
+        raise HTTPException(status_code=500, detail="Chat API error.")
+
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def ask_llm(question: str, context: str) -> str:
     system_prompt = """
 You are a strict document-based RAG assistant.
 Use only the provided context.
@@ -244,31 +278,11 @@ Do not use outside knowledge.
 Do not guess.
 """
 
-    payload = {
-        "model": REMOTE_CHAT_MODEL,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion:\n{question}",
-            },
-        ],
-    }
-
-    resp = requests.post(
-        REMOTE_CHAT_URL,
-        headers=headers,
-        json=payload,
+    return call_chat_model(
+        system_prompt,
+        f"Context:\n{context}\n\nQuestion:\n{question}",
         timeout=180,
     )
-
-    if resp.status_code != 200:
-        logger.error("Chat API error: %s - %s", resp.status_code, resp.text)
-        raise HTTPException(status_code=500, detail="Chat API error.")
-
-    data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
 
 
 def extract_pdf_text(file_path: str) -> str:
@@ -283,20 +297,182 @@ def extract_pdf_text(file_path: str) -> str:
     return "\n".join(pages)
 
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    text = " ".join(text.split())
+def normalize_text_space(text: str) -> str:
+    return " ".join((text or "").split())
 
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"\S+", text or ""))
+
+
+def split_text_pages(text: str):
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    marker_re = re.compile(r"---\s*PAGE\s+(\d+)\s*---", re.IGNORECASE)
+    matches = list(marker_re.finditer(normalized))
+
+    if not matches:
+        return [(None, normalized)]
+
+    pages = []
+
+    for idx, match in enumerate(matches):
+        page_no = match.group(1)
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(normalized)
+        pages.append((page_no, normalized[start:end].strip()))
+
+    return pages
+
+
+def split_paragraphs(text: str) -> List[str]:
+    paragraphs = []
+
+    for paragraph in re.split(r"\n\s*\n+", text or ""):
+        normalized = normalize_text_space(paragraph)
+
+        if normalized:
+            paragraphs.append(normalized)
+
+    return paragraphs
+
+
+def split_sentences(text: str) -> List[str]:
+    normalized = normalize_text_space(text)
+
+    if not normalized:
+        return []
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", normalized)
+        if sentence.strip()
+    ]
+
+    return sentences or [normalized]
+
+
+def split_words_window(text: str, max_words: int, overlap_words: int = 0) -> List[str]:
+    words = normalize_text_space(text).split()
+
+    if not words:
+        return []
+
+    step = max(1, max_words - max(0, min(overlap_words, max_words - 1)))
+
+    return [
+        " ".join(words[i:i + max_words])
+        for i in range(0, len(words), step)
+    ]
+
+
+def split_long_paragraph(paragraph: str, max_words: int) -> List[str]:
+    paragraph = normalize_text_space(paragraph)
+
+    if count_words(paragraph) <= max_words:
+        return [paragraph] if paragraph else []
+
+    units = []
+    current = []
+    current_words = 0
+
+    for sentence in split_sentences(paragraph):
+        sentence_words = count_words(sentence)
+
+        if sentence_words > max_words:
+            if current:
+                units.append(" ".join(current).strip())
+                current = []
+                current_words = 0
+
+            units.extend(split_words_window(sentence, max_words, CHUNK_OVERLAP_WORDS))
+            continue
+
+        if current and current_words + sentence_words > max_words:
+            units.append(" ".join(current).strip())
+            current = []
+            current_words = 0
+
+        current.append(sentence)
+        current_words += sentence_words
+
+    if current:
+        units.append(" ".join(current).strip())
+
+    return [unit for unit in units if unit]
+
+
+def build_page_chunks(page_no, units: List[str], max_words: int, overlap_words: int) -> List[str]:
     chunks = []
-    start = 0
+    current_parts = []
+    current_words = 0
+    current_has_new_content = False
+    overlap_words = max(0, min(overlap_words, max_words - 1))
 
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end].strip()
+    def flush_current(carry_overlap: bool):
+        nonlocal current_parts, current_words, current_has_new_content
 
-        if chunk:
-            chunks.append(chunk)
+        if current_has_new_content:
+            chunk = normalize_text_space(" ".join(current_parts))
 
-        start += chunk_size - overlap
+            if chunk:
+                if page_no:
+                    chunk = f"--- PAGE {page_no} ---\n{chunk}"
+
+                chunks.append(chunk)
+
+            if carry_overlap and overlap_words > 0:
+                plain_chunk = normalize_text_space(" ".join(current_parts))
+                overlap_text = " ".join(plain_chunk.split()[-overlap_words:])
+                current_parts = [overlap_text] if overlap_text else []
+                current_words = count_words(overlap_text)
+                current_has_new_content = False
+                return
+
+        current_parts = []
+        current_words = 0
+        current_has_new_content = False
+
+    for unit in units:
+        unit = normalize_text_space(unit)
+        unit_words = count_words(unit)
+
+        if not unit or unit_words == 0:
+            continue
+
+        if current_has_new_content and current_words + unit_words > max_words:
+            flush_current(carry_overlap=True)
+
+        if not current_has_new_content and current_words + unit_words > max_words:
+            current_parts = []
+            current_words = 0
+
+        current_parts.append(unit)
+        current_words += unit_words
+        current_has_new_content = True
+
+    flush_current(carry_overlap=False)
+    return chunks
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int = CHUNK_MAX_WORDS,
+    overlap: int = CHUNK_OVERLAP_WORDS,
+) -> List[str]:
+    max_words = max(1, chunk_size)
+    overlap_words = max(0, overlap)
+    raw_chunks = []
+
+    for page_no, page_text in split_text_pages(text):
+        units = []
+
+        for paragraph in split_paragraphs(page_text):
+            units.extend(split_long_paragraph(paragraph, max_words))
+
+        raw_chunks.extend(build_page_chunks(page_no, units, max_words, overlap_words))
+
+    min_words = max(1, CHUNK_MIN_WORDS)
+    chunks = [chunk for chunk in raw_chunks if count_words(chunk) >= min_words]
 
     return chunks
 
@@ -327,17 +503,181 @@ def build_context_from_items(items: List[Dict[str, Any]]):
     return context, sources
 
 
-def empty_result(total_start, embed_time=0, retrieval_time=0):
+def empty_result(total_start, embed_time=0, retrieval_time=0, rewrite_time=0, rerank_time=0):
     return {
         "answer": NOT_FOUND_TR,
         "sources": [],
         "timings": {
+            "rewrite": rewrite_time,
             "embedding": embed_time,
             "retrieval": retrieval_time,
+            "rerank": rerank_time,
             "llm": 0,
             "total": elapsed(total_start),
         },
     }
+
+
+def retrieval_candidate_limit() -> int:
+    return max(TOP_K, RETRIEVAL_CANDIDATE_K)
+
+
+def rewrite_question_for_search(question: str) -> str:
+    system_prompt = """
+You rewrite user questions into concise vector-search queries.
+Expand abbreviations, product names, error codes, and likely technical terms when useful.
+Return only the rewritten search query. Do not answer the question.
+"""
+    user_prompt = f"""
+Original question:
+{question}
+
+Rewrite it for semantic/vector retrieval. Keep it under 40 words.
+"""
+
+    try:
+        rewritten = call_chat_model(system_prompt, user_prompt, timeout=60)
+        rewritten = normalize_text_space(rewritten.strip().strip('"').strip("'"))
+
+        if not rewritten:
+            return question
+
+        return rewritten
+    except Exception as exc:
+        logger.warning("Question rewrite failed, falling back to original question: %s", exc)
+        return question
+
+
+def prepare_query_embedding(question: str):
+    s = now()
+    search_query = rewrite_question_for_search(question)
+    rewrite_time = elapsed(s)
+
+    s = now()
+    q_emb = get_embedding(search_query)
+    embed_time = elapsed(s)
+
+    return search_query, q_emb, rewrite_time, embed_time
+
+
+def sort_chunks_by_similarity(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        candidates,
+        key=lambda item: float(item.get("similarity") or 0),
+        reverse=True,
+    )[:TOP_K]
+
+
+def extract_json_payload(text: str):
+    cleaned = (text or "").strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", cleaned)
+
+        if not match:
+            raise
+
+        return json.loads(match.group(1))
+
+
+def parse_rerank_scores(response_text: str) -> Dict[int, float]:
+    payload = extract_json_payload(response_text)
+
+    if isinstance(payload, dict):
+        payload = payload.get("scores") or payload.get("results") or payload.get("rankings")
+
+    if not isinstance(payload, list):
+        raise ValueError("Rerank response must be a JSON list.")
+
+    scores = {}
+
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+
+        raw_id = item.get("id", item.get("index"))
+        raw_score = item.get("score", item.get("relevance"))
+
+        if raw_id is None or raw_score is None:
+            continue
+
+        idx = int(raw_id)
+        score = float(raw_score)
+        scores[idx] = max(0.0, min(1.0, score))
+
+    if not scores:
+        raise ValueError("Rerank response did not contain scores.")
+
+    return scores
+
+
+def rerank_chunks(question: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not candidates:
+        return []
+
+    fallback = sort_chunks_by_similarity(candidates)
+
+    if not ENABLE_LLM_RERANK:
+        return fallback
+
+    limited_candidates = candidates[:max(TOP_K, RERANK_MAX_CANDIDATES)]
+    candidate_lines = []
+
+    for idx, item in enumerate(limited_candidates):
+        content = normalize_text_space(str(item.get("content") or ""))[:RERANK_CHUNK_MAX_CHARS]
+        candidate_lines.append(
+            "\n".join(
+                [
+                    f"ID: {idx}",
+                    f"File: {item.get('file_name')}",
+                    f"Chunk: {item.get('chunk_index')}",
+                    f"Vector similarity: {float(item.get('similarity') or 0):.4f}",
+                    f"Text: {content}",
+                ]
+            )
+        )
+
+    system_prompt = """
+You are a strict reranker for document retrieval.
+Score each candidate chunk for how useful it is to answer the user's original question.
+Return only JSON. Use this exact shape:
+[{"id": 0, "score": 0.0}]
+Scores must be between 0 and 1.
+"""
+    user_prompt = (
+        f"Question:\n{question}\n\n"
+        "Candidate chunks:\n"
+        + "\n\n---\n\n".join(candidate_lines)
+    )
+
+    try:
+        response_text = call_chat_model(system_prompt, user_prompt, timeout=90)
+        score_by_id = parse_rerank_scores(response_text)
+    except Exception as exc:
+        logger.warning("LLM rerank failed, using vector scores: %s", exc)
+        return fallback
+
+    reranked = []
+
+    for idx, item in enumerate(limited_candidates):
+        copied = dict(item)
+        copied["rerank_score"] = score_by_id.get(idx, float(item.get("similarity") or 0))
+        reranked.append(copied)
+
+    return sorted(
+        reranked,
+        key=lambda item: (
+            float(item.get("rerank_score") or 0),
+            float(item.get("similarity") or 0),
+        ),
+        reverse=True,
+    )[:TOP_K]
 
 
 def elastic_score_to_cosine(score: float) -> float:
@@ -1344,11 +1684,10 @@ def pg_ask(req: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty.")
 
-    s = now()
-    q_emb = get_embedding(question)
+    search_query, q_emb, rewrite_time, embed_time = prepare_query_embedding(question)
     q_halfvec = vector_to_halfvec_sql(q_emb)
     q_fullvec = vector_to_sql(q_emb)
-    embed_time = elapsed(s)
+    candidate_limit = retrieval_candidate_limit()
 
     s = now()
     conn = get_pg_connection()
@@ -1378,7 +1717,13 @@ def pg_ask(req: AskRequest):
                 ORDER BY embedding <=> %s::vector(4096)
                 LIMIT %s
                 """,
-                (q_halfvec, PG_CANDIDATE_K, q_fullvec, q_fullvec, TOP_K),
+                (
+                    q_halfvec,
+                    max(PG_CANDIDATE_K, candidate_limit),
+                    q_fullvec,
+                    q_fullvec,
+                    candidate_limit,
+                ),
             )
             rows = cur.fetchall()
     finally:
@@ -1387,17 +1732,21 @@ def pg_ask(req: AskRequest):
     retrieval_time = elapsed(s)
 
     if not rows or float(rows[0][3]) < SIMILARITY_THRESHOLD:
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time)
 
     items = [
         {"file_name": r[0], "chunk_index": r[1], "content": r[2], "similarity": float(r[3])}
         for r in rows
     ]
 
-    context, sources = build_context_from_items(items)
+    s = now()
+    ranked_items = rerank_chunks(question, items)
+    rerank_time = elapsed(s)
+
+    context, sources = build_context_from_items(ranked_items)
 
     if not context.strip():
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time, rerank_time)
 
     s = now()
     answer = ask_llm(question, context)
@@ -1407,8 +1756,10 @@ def pg_ask(req: AskRequest):
         "answer": answer,
         "sources": sources,
         "timings": {
+            "rewrite": rewrite_time,
             "embedding": embed_time,
             "retrieval": retrieval_time,
+            "rerank": rerank_time,
             "llm": llm_time,
             "total": elapsed(total_start),
         },
@@ -1553,9 +1904,8 @@ def milvus_ask(req: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty.")
 
-    s = now()
-    q_emb = get_embedding(question)
-    embed_time = elapsed(s)
+    search_query, q_emb, rewrite_time, embed_time = prepare_query_embedding(question)
+    candidate_limit = retrieval_candidate_limit()
 
     collection = get_milvus_collection()
 
@@ -1573,7 +1923,7 @@ def milvus_ask(req: AskRequest):
         data=[q_emb],
         anns_field="embedding",
         param=search_params,
-        limit=TOP_K,
+        limit=candidate_limit,
         output_fields=["file_name", "chunk_index", "content"],
     )
 
@@ -1582,7 +1932,7 @@ def milvus_ask(req: AskRequest):
     hits = results[0]
 
     if not hits or float(hits[0].score) < SIMILARITY_THRESHOLD:
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time)
 
     items = []
 
@@ -1597,10 +1947,14 @@ def milvus_ask(req: AskRequest):
             }
         )
 
-    context, sources = build_context_from_items(items)
+    s = now()
+    ranked_items = rerank_chunks(question, items)
+    rerank_time = elapsed(s)
+
+    context, sources = build_context_from_items(ranked_items)
 
     if not context.strip():
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time, rerank_time)
 
     s = now()
     answer = ask_llm(question, context)
@@ -1610,8 +1964,10 @@ def milvus_ask(req: AskRequest):
         "answer": answer,
         "sources": sources,
         "timings": {
+            "rewrite": rewrite_time,
             "embedding": embed_time,
             "retrieval": retrieval_time,
+            "rerank": rerank_time,
             "llm": llm_time,
             "total": elapsed(total_start),
         },
@@ -1768,10 +2124,9 @@ def oracle_ask(req: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty.")
 
-    s = now()
-    q_emb = get_embedding(question)
+    search_query, q_emb, rewrite_time, embed_time = prepare_query_embedding(question)
     q_vec = to_oracle_float32_vector(q_emb)
-    embed_time = elapsed(s)
+    candidate_limit = retrieval_candidate_limit()
 
     s = now()
     conn = get_oracle_connection()
@@ -1788,7 +2143,7 @@ def oracle_ask(req: AskRequest):
                 1 - VECTOR_DISTANCE(embedding, :q_vec, COSINE) AS similarity
             FROM {ORACLE_TABLE}
             ORDER BY VECTOR_DISTANCE(embedding, :q_vec, COSINE)
-            FETCH FIRST {TOP_K} ROWS ONLY
+            FETCH FIRST {candidate_limit} ROWS ONLY
             """,
             q_vec=q_vec,
         )
@@ -1811,17 +2166,21 @@ def oracle_ask(req: AskRequest):
     retrieval_time = elapsed(s)
 
     if not rows or float(rows[0][3]) < SIMILARITY_THRESHOLD:
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time)
 
     items = [
         {"file_name": r[0], "chunk_index": r[1], "content": r[2], "similarity": float(r[3])}
         for r in rows
     ]
 
-    context, sources = build_context_from_items(items)
+    s = now()
+    ranked_items = rerank_chunks(question, items)
+    rerank_time = elapsed(s)
+
+    context, sources = build_context_from_items(ranked_items)
 
     if not context.strip():
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time, rerank_time)
 
     s = now()
     answer = ask_llm(question, context)
@@ -1831,8 +2190,10 @@ def oracle_ask(req: AskRequest):
         "answer": answer,
         "sources": sources,
         "timings": {
+            "rewrite": rewrite_time,
             "embedding": embed_time,
             "retrieval": retrieval_time,
+            "rerank": rerank_time,
             "llm": llm_time,
             "total": elapsed(total_start),
         },
@@ -1979,9 +2340,8 @@ def qdrant_ask(req: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty.")
 
-    s = now()
-    q_emb = get_embedding(question)
-    embed_time = elapsed(s)
+    search_query, q_emb, rewrite_time, embed_time = prepare_query_embedding(question)
+    candidate_limit = retrieval_candidate_limit()
 
     client = ensure_qdrant_collection()
 
@@ -1990,7 +2350,7 @@ def qdrant_ask(req: AskRequest):
     query_result = client.query_points(
         collection_name=QDRANT_COLLECTION,
         query=q_emb,
-        limit=TOP_K,
+        limit=candidate_limit,
         with_payload=True,
     )
 
@@ -1998,7 +2358,7 @@ def qdrant_ask(req: AskRequest):
     retrieval_time = elapsed(s)
 
     if not results or float(results[0].score) < SIMILARITY_THRESHOLD:
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time)
 
     items = []
 
@@ -2014,10 +2374,14 @@ def qdrant_ask(req: AskRequest):
             }
         )
 
-    context, sources = build_context_from_items(items)
+    s = now()
+    ranked_items = rerank_chunks(question, items)
+    rerank_time = elapsed(s)
+
+    context, sources = build_context_from_items(ranked_items)
 
     if not context.strip():
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time, rerank_time)
 
     s = now()
     answer = ask_llm(question, context)
@@ -2027,8 +2391,10 @@ def qdrant_ask(req: AskRequest):
         "answer": answer,
         "sources": sources,
         "timings": {
+            "rewrite": rewrite_time,
             "embedding": embed_time,
             "retrieval": retrieval_time,
+            "rerank": rerank_time,
             "llm": llm_time,
             "total": elapsed(total_start),
         },
@@ -2190,9 +2556,8 @@ def elasticsearch_ask(req: AskRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question is empty.")
 
-    s = now()
-    q_emb = get_embedding(question)
-    embed_time = elapsed(s)
+    search_query, q_emb, rewrite_time, embed_time = prepare_query_embedding(question)
+    candidate_limit = retrieval_candidate_limit()
 
     client = ensure_es_index()
 
@@ -2203,18 +2568,18 @@ def elasticsearch_ask(req: AskRequest):
         knn={
             "field": "embedding",
             "query_vector": q_emb,
-            "k": TOP_K,
-            "num_candidates": max(ES_NUM_CANDIDATES, TOP_K),
+            "k": candidate_limit,
+            "num_candidates": max(ES_NUM_CANDIDATES, candidate_limit),
         },
         source=["file_name", "chunk_index", "content"],
-        size=TOP_K,
+        size=candidate_limit,
     )
 
     hits = response.get("hits", {}).get("hits", [])
     retrieval_time = elapsed(s)
 
     if not hits or elastic_score_to_cosine(hits[0].get("_score", 0)) < SIMILARITY_THRESHOLD:
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time)
 
     items = []
 
@@ -2230,10 +2595,14 @@ def elasticsearch_ask(req: AskRequest):
             }
         )
 
-    context, sources = build_context_from_items(items)
+    s = now()
+    ranked_items = rerank_chunks(question, items)
+    rerank_time = elapsed(s)
+
+    context, sources = build_context_from_items(ranked_items)
 
     if not context.strip():
-        return empty_result(total_start, embed_time, retrieval_time)
+        return empty_result(total_start, embed_time, retrieval_time, rewrite_time, rerank_time)
 
     s = now()
     answer = ask_llm(question, context)
@@ -2243,8 +2612,10 @@ def elasticsearch_ask(req: AskRequest):
         "answer": answer,
         "sources": sources,
         "timings": {
+            "rewrite": rewrite_time,
             "embedding": embed_time,
             "retrieval": retrieval_time,
+            "rerank": rerank_time,
             "llm": llm_time,
             "total": elapsed(total_start),
         },
@@ -2308,6 +2679,12 @@ def health():
         "embedding_dim": EMBEDDING_DIM,
         "halfvec_dim": HALFVEC_DIM,
         "embedding_batch_size": EMBEDDING_BATCH_SIZE,
+        "chunk_max_words": CHUNK_MAX_WORDS,
+        "chunk_overlap_words": CHUNK_OVERLAP_WORDS,
+        "chunk_min_words": CHUNK_MIN_WORDS,
+        "retrieval_candidate_k": RETRIEVAL_CANDIDATE_K,
+        "enable_llm_rerank": ENABLE_LLM_RERANK,
+        "rerank_max_candidates": RERANK_MAX_CANDIDATES,
         "top_k": TOP_K,
         "similarity_threshold": SIMILARITY_THRESHOLD,
         "app_host": APP_HOST,
