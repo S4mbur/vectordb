@@ -1,4 +1,60 @@
 /* =========================================================
+   DBADash Custom Report Example
+   BUNU DBADash REPOSITORY DATABASE'DE ÇALIŞTIR.
+   DBADashDemo database içinde çalıştırma.
+   ========================================================= */
+
+USE [DBADashDB];  -- Burayı kendi DBADash repository DB adınla değiştir.
+GO
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.schemas
+    WHERE name = N'UserReport'
+)
+BEGIN
+    EXEC(N'CREATE SCHEMA UserReport');
+END
+GO
+
+CREATE OR ALTER PROCEDURE UserReport.DemoDatabaseInventory
+(
+    @InstanceIDs IDs READONLY,
+    @DatabaseName sysname = N'DBADashDemo'
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        I.ConnectionID,
+        D.name AS DatabaseName,
+        D.DatabaseID,
+        D.InstanceID
+    FROM dbo.Databases D
+    JOIN dbo.Instances I
+        ON D.InstanceID = I.InstanceID
+    JOIN @InstanceIDs T
+        ON T.ID = I.InstanceID
+    WHERE
+        @DatabaseName IS NULL
+        OR D.name = @DatabaseName
+    ORDER BY
+        I.ConnectionID,
+        D.name;
+END;
+GO
+
+IF DATABASE_PRINCIPAL_ID(N'RunUserReports') IS NOT NULL
+BEGIN
+    GRANT EXECUTE ON SCHEMA::UserReport TO RunUserReports;
+END
+GO
+
+
+
+/* =========================================================
    DBADash Demo Lab - ALL IN ONE SCRIPT
    SQL Server / SSMS / Azure Data Studio
 
