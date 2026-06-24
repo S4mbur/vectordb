@@ -1,3 +1,48 @@
+
+USE [DBADashDB]; -- Burayı DBA Dash repository DB adınla değiştir.
+GO
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.schemas
+    WHERE name = N'UserReport'
+)
+BEGIN
+    EXEC(N'CREATE SCHEMA UserReport');
+END
+GO
+
+CREATE OR ALTER PROCEDURE UserReport.Burak_Test_Instance_Report
+(
+    @InstanceIDs IDs READONLY
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        I.InstanceID,
+        I.ConnectionID,
+        I.InstanceDisplayName,
+        I.EngineEdition,
+        I.Edition,
+        I.ProductVersion,
+        I.ProductLevel
+    FROM dbo.Instances I
+    JOIN @InstanceIDs T
+        ON T.ID = I.InstanceID
+    ORDER BY I.ConnectionID;
+END;
+GO
+
+GRANT EXECUTE ON SCHEMA::UserReport TO RunUserReports;
+GO
+
+
+
+
+
 /* =========================================================
    DBADash Custom Report Example
    BUNU DBADash REPOSITORY DATABASE'DE ÇALIŞTIR.
