@@ -1,279 +1,51 @@
 /* =========================================================
-   DBA Dash 4.9 Custom Reports - Burak Demo Pack
+   Eski DBADash Custom Report Temizliği
 
    BUNU DBADash REPOSITORY DATABASE'DE ÇALIŞTIR.
-   Monitored SQL Server'daki DBADashDemo içinde çalıştırma.
+   Monitored DBADashDemo içinde çalıştırma.
 
-   SADECE ŞUNU DEĞİŞTİR:
-   USE [DBADashDB]
+   Sadece USE kısmını kendi repository DB adına göre değiştir.
    ========================================================= */
 
 USE [DBADashDB]; -- Burayı kendi DBA Dash repository DB adınla değiştir
 GO
 
+/* Eski deneme raporları */
 
-/* =========================================================
-   0) UserReport schema oluştur
-   ========================================================= */
+IF OBJECT_ID(N'UserReport.DemoDatabaseInventory', N'P') IS NOT NULL
+    DROP PROCEDURE UserReport.DemoDatabaseInventory;
+GO
 
-IF NOT EXISTS
-(
-    SELECT 1
-    FROM sys.schemas
-    WHERE name = N'UserReport'
-)
-BEGIN
-    EXEC(N'CREATE SCHEMA UserReport');
-END
+IF OBJECT_ID(N'UserReport.SelectedDatabaseInfo', N'P') IS NOT NULL
+    DROP PROCEDURE UserReport.SelectedDatabaseInfo;
+GO
+
+IF OBJECT_ID(N'UserReport.Burak_Test_Instance_Report', N'P') IS NOT NULL
+    DROP PROCEDURE UserReport.Burak_Test_Instance_Report;
+GO
+
+IF OBJECT_ID(N'UserReport.Burak_Test_Database_Report', N'P') IS NOT NULL
+    DROP PROCEDURE UserReport.Burak_Test_Database_Report;
+GO
+
+IF OBJECT_ID(N'UserReport.Burak_CustomReport_Test', N'P') IS NOT NULL
+    DROP PROCEDURE UserReport.Burak_CustomReport_Test;
+GO
+
+IF OBJECT_ID(N'UserReport.Burak_DemoDB_Check', N'P') IS NOT NULL
+    DROP PROCEDURE UserReport.Burak_DemoDB_Check;
+GO
+
+IF OBJECT_ID(N'UserReport.Burak_Test_Report', N'P') IS NOT NULL
+    DROP PROCEDURE UserReport.Burak_Test_Report;
+GO
+
+IF OBJECT_ID(N'UserReport.Burak_DemoDB_Status', N'P') IS NOT NULL
+    DROP PROCEDURE UserReport.Burak_DemoDB_Status;
 GO
 
 
-/* =========================================================
-   1) En basit test report
-   Bu kesin veri döndürür.
-   ========================================================= */
-
-CREATE OR ALTER PROCEDURE UserReport.Burak_01_CustomReport_Test
-(
-    @InstanceIDs IDs READONLY
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    SELECT
-        'Custom report sistemi calisiyor' AS Status,
-        DB_NAME() AS RepositoryDatabaseName,
-        COUNT(*) AS SelectedInstanceCount,
-        SYSDATETIME() AS ReportRunTime
-    FROM @InstanceIDs;
-END;
-GO
-
-
-/* =========================================================
-   2) Repository tablo satır sayıları
-   Bu da kesin veri döndürür.
-   DBA Dash repository içinde hangi tabloda kaç satır var gösterir.
-   ========================================================= */
-
-CREATE OR ALTER PROCEDURE UserReport.Burak_02_Repository_Table_Counts
-(
-    @InstanceIDs IDs READONLY
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    SELECT TOP (100)
-        SCHEMA_NAME(t.schema_id) AS SchemaName,
-        t.name AS TableName,
-        SUM(p.rows) AS ApproxRowCount
-    FROM sys.tables t
-    JOIN sys.partitions p
-        ON p.object_id = t.object_id
-       AND p.index_id IN (0, 1)
-    WHERE 
-        t.is_ms_shipped = 0
-        AND SCHEMA_NAME(t.schema_id) = N'dbo'
-    GROUP BY
-        SCHEMA_NAME(t.schema_id),
-        t.name
-    ORDER BY
-        SUM(p.rows) DESC,
-        t.name;
-END;
-GO
-
-
-/* =========================================================
-   3) Instance listesi
-   DBA Dash repository içinde izlenen instance'ları gösterir.
-   SELECT * kullandık ki 4.9 kolon farklarına takılmasın.
-   ========================================================= */
-
-CREATE OR ALTER PROCEDURE UserReport.Burak_03_Instance_List
-(
-    @InstanceIDs IDs READONLY
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    IF OBJECT_ID(N'dbo.Instances', N'U') IS NULL
-    BEGIN
-        SELECT
-            'dbo.Instances tablosu bu repository DB icinde bulunamadi' AS Status,
-            DB_NAME() AS CurrentDatabaseName;
-        RETURN;
-    END;
-
-    SELECT TOP (100)
-        I.*
-    FROM dbo.Instances I
-    WHERE
-        NOT EXISTS (SELECT 1 FROM @InstanceIDs)
-        OR I.InstanceID IN (SELECT ID FROM @InstanceIDs)
-    ORDER BY
-        I.InstanceID;
-END;
-GO
-
-
-/* =========================================================
-   4) Database listesi
-   DBA Dash repository'ye düşmüş database'leri gösterir.
-   SELECT * kullandık ki kolon farkına takılmasın.
-   ========================================================= */
-
-CREATE OR ALTER PROCEDURE UserReport.Burak_04_Database_List
-(
-    @InstanceIDs IDs READONLY
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    IF OBJECT_ID(N'dbo.Databases', N'U') IS NULL
-    BEGIN
-        SELECT
-            'dbo.Databases tablosu bu repository DB icinde bulunamadi' AS Status,
-            DB_NAME() AS CurrentDatabaseName;
-        RETURN;
-    END;
-
-    SELECT TOP (200)
-        D.*
-    FROM dbo.Databases D
-    WHERE
-        NOT EXISTS (SELECT 1 FROM @InstanceIDs)
-        OR D.InstanceID IN (SELECT ID FROM @InstanceIDs)
-    ORDER BY
-        D.InstanceID,
-        D.name;
-END;
-GO
-
-
-/* =========================================================
-   5) DBADashDemo repository'ye düşmüş mü?
-   Bu rapor her zaman 1 satır döner.
-   Eğer DemoDBCount = 0 ise collector henüz DBADashDemo'yu toplamamış demektir.
-   ========================================================= */
-
-CREATE OR ALTER PROCEDURE UserReport.Burak_05_DemoDB_Status
-(
-    @InstanceIDs IDs READONLY
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    IF OBJECT_ID(N'dbo.Databases', N'U') IS NULL
-    BEGIN
-        SELECT
-            'dbo.Databases tablosu bulunamadi' AS Status,
-            DB_NAME() AS CurrentDatabaseName,
-            0 AS TotalDatabaseRows,
-            0 AS DemoDBCount,
-            SYSDATETIME() AS ReportRunTime;
-        RETURN;
-    END;
-
-    SELECT
-        'DBADashDemo repository kontrolu' AS ReportName,
-        DB_NAME() AS RepositoryDatabaseName,
-        COUNT(*) AS TotalDatabaseRows,
-        SUM(CASE WHEN D.name = N'DBADashDemo' THEN 1 ELSE 0 END) AS DemoDBCount,
-        CASE
-            WHEN SUM(CASE WHEN D.name = N'DBADashDemo' THEN 1 ELSE 0 END) > 0
-                THEN 'DBADashDemo repository icinde VAR'
-            ELSE 'DBADashDemo repository icinde YOK'
-        END AS Status,
-        SYSDATETIME() AS ReportRunTime
-    FROM dbo.Databases D
-    WHERE
-        NOT EXISTS (SELECT 1 FROM @InstanceIDs)
-        OR D.InstanceID IN (SELECT ID FROM @InstanceIDs);
-END;
-GO
-
-
-/* =========================================================
-   6) Custom report listesi
-   Oluşturduğun UserReport procedure'lerini gösterir.
-   Bu da kesin veri döndürür.
-   ========================================================= */
-
-CREATE OR ALTER PROCEDURE UserReport.Burak_06_CustomReports_List
-(
-    @InstanceIDs IDs READONLY
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    SELECT
-        s.name AS SchemaName,
-        p.name AS ProcedureName,
-        p.create_date,
-        p.modify_date
-    FROM sys.procedures p
-    JOIN sys.schemas s
-        ON s.schema_id = p.schema_id
-    WHERE s.name = N'UserReport'
-    ORDER BY
-        p.name;
-END;
-GO
-
-
-/* =========================================================
-   7) Database-level report
-   Bu root'ta görünmez.
-   Bir database node'una tıklayınca Reports altında görünür.
-   ========================================================= */
-
-CREATE OR ALTER PROCEDURE UserReport.Burak_07_Selected_Database_Raw
-(
-    @DatabaseID INT
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    IF OBJECT_ID(N'dbo.Databases', N'U') IS NULL
-    BEGIN
-        SELECT
-            'dbo.Databases tablosu bulunamadi' AS Status,
-            DB_NAME() AS CurrentDatabaseName;
-        RETURN;
-    END;
-
-    SELECT
-        D.*
-    FROM dbo.Databases D
-    WHERE D.DatabaseID = @DatabaseID;
-END;
-GO
-
-
-/* =========================================================
-   8) Yetki ver
-   RunUserReports rolü varsa execute yetkisi verilir.
-   ========================================================= */
-
-IF DATABASE_PRINCIPAL_ID(N'RunUserReports') IS NOT NULL
-BEGIN
-    GRANT EXECUTE ON SCHEMA::UserReport TO RunUserReports;
-END
-GO
-
-
-/* =========================================================
-   9) Kontrol çıktısı
-   Bu SSMS'te çalıştırınca oluşturulan raporları gösterir.
-   ========================================================= */
+/* Kalan custom reportları kontrol et */
 
 SELECT
     s.name AS SchemaName,
@@ -284,6 +56,5 @@ FROM sys.procedures p
 JOIN sys.schemas s
     ON s.schema_id = p.schema_id
 WHERE s.name = N'UserReport'
-  AND p.name LIKE N'Burak_%'
 ORDER BY p.name;
 GO
