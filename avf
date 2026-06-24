@@ -1,3 +1,80 @@
+USE [DBADashDB]; -- Kendi DBADash repository DB adınla değiştir.
+GO
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.schemas
+    WHERE name = N'UserReport'
+)
+BEGIN
+    EXEC(N'CREATE SCHEMA UserReport');
+END
+GO
+
+CREATE OR ALTER PROCEDURE UserReport.Burak_CustomReport_Test
+(
+    @InstanceIDs IDs READONLY
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        'Custom report calisiyor' AS ReportStatus,
+        COUNT(*) AS SelectedInstanceCount,
+        SYSDATETIME() AS ReportRunTime
+    FROM @InstanceIDs;
+END;
+GO
+
+GRANT EXECUTE ON SCHEMA::UserReport TO RunUserReports;
+GO
+
+USE [DBADashDB]; -- Kendi DBADash repository DB adınla değiştir.
+GO
+
+CREATE OR ALTER PROCEDURE UserReport.Burak_DemoDB_Check
+(
+    @InstanceIDs IDs READONLY
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        D.InstanceID,
+        D.DatabaseID,
+        D.name AS DatabaseName,
+        D.state_desc,
+        D.recovery_model_desc,
+        D.create_date,
+        CASE
+            WHEN D.name = N'DBADashDemo' THEN 'Demo DB bulundu'
+            ELSE 'Diger DB'
+        END AS DemoStatus
+    FROM dbo.Databases D
+    WHERE D.name = N'DBADashDemo'
+    ORDER BY D.InstanceID, D.name;
+END;
+GO
+
+GRANT EXECUTE ON SCHEMA::UserReport TO RunUserReports;
+GO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 USE [DBADashDB]; -- Burayı DBA Dash repository DB adınla değiştir.
 GO
