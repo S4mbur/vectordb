@@ -1,8 +1,8 @@
 /* =========================================================
-   Eski DBADash Custom Report Temizliği
+   DBA Dash Custom Reports - Waiting / Blocking Query Reports
 
    BUNU DBADash REPOSITORY DATABASE'DE ÇALIŞTIR.
-   Monitored DBADashDemo içinde çalıştırma.
+   Monitored DBADashDemo database içinde çalıştırma.
 
    Sadece USE kısmını kendi repository DB adına göre değiştir.
    ========================================================= */
@@ -10,42 +10,429 @@
 USE [DBADashDB]; -- Burayı kendi DBA Dash repository DB adınla değiştir
 GO
 
-/* Eski deneme raporları */
 
-IF OBJECT_ID(N'UserReport.DemoDatabaseInventory', N'P') IS NOT NULL
-    DROP PROCEDURE UserReport.DemoDatabaseInventory;
-GO
+/* =========================================================
+   0) UserReport schema
+   ========================================================= */
 
-IF OBJECT_ID(N'UserReport.SelectedDatabaseInfo', N'P') IS NOT NULL
-    DROP PROCEDURE UserReport.SelectedDatabaseInfo;
-GO
-
-IF OBJECT_ID(N'UserReport.Burak_Test_Instance_Report', N'P') IS NOT NULL
-    DROP PROCEDURE UserReport.Burak_Test_Instance_Report;
-GO
-
-IF OBJECT_ID(N'UserReport.Burak_Test_Database_Report', N'P') IS NOT NULL
-    DROP PROCEDURE UserReport.Burak_Test_Database_Report;
-GO
-
-IF OBJECT_ID(N'UserReport.Burak_CustomReport_Test', N'P') IS NOT NULL
-    DROP PROCEDURE UserReport.Burak_CustomReport_Test;
-GO
-
-IF OBJECT_ID(N'UserReport.Burak_DemoDB_Check', N'P') IS NOT NULL
-    DROP PROCEDURE UserReport.Burak_DemoDB_Check;
-GO
-
-IF OBJECT_ID(N'UserReport.Burak_Test_Report', N'P') IS NOT NULL
-    DROP PROCEDURE UserReport.Burak_Test_Report;
-GO
-
-IF OBJECT_ID(N'UserReport.Burak_DemoDB_Status', N'P') IS NOT NULL
-    DROP PROCEDURE UserReport.Burak_DemoDB_Status;
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.schemas
+    WHERE name = N'UserReport'
+)
+BEGIN
+    EXEC(N'CREATE SCHEMA UserReport');
+END
 GO
 
 
-/* Kalan custom reportları kontrol et */
+/* =========================================================
+   1) Latest Waiting Queries
+   Her instance için son snapshot'taki bekleyen / blocked queryleri gösterir.
+
+   Gösterdikleri:
+   - Instance
+   - Database
+   - Session ID
+   - Wait type
+   - Wait süresi
+   - Blocking session
+   - Duration
+   - SQL hash / handle
+   - SQL text
+   ========================================================= */
+
+CREATE OR ALTER PROCEDURE UserReport.Burak_08_Latest_Waiting_Queries
+(
+    @InstanceIDs IDs READONLY
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF OBJECT_ID(N'dbo.RunningQueriesInfo', N'V') IS NULL
+    BEGIN
+        SELECT
+            'dbo.RunningQueriesInfo view bulunamadi. Running Queries collection/repository schema mevcut olmayabilir.' AS Status,
+            DB_NAME() AS RepositoryDatabaseName,
+            SYSDATETIME() AS ReportRunTime;
+        RETURN;
+    END;
+
+    ;WITH LatestSnapshot AS
+    (
+        SELECT
+            RQI.InstanceID,
+            MAX(RQI.SnapshotDateUTC) AS SnapshotDateUTC
+        FROM dbo.RunningQueriesInfo RQI
+        WHERE
+            NOT EXISTS (SELECT 1 FROM @InstanceIDs)
+            OR RQI.InstanceID IN (SELECT ID FROM @InstanceIDs)
+        GROUP BY RQI.InstanceID
+    )
+    SELECT TOP (200)
+        RQI.InstanceDisplayName,
+        RQI.SnapshotDateUTC,
+        ISNULL(RQI.database_name, N'(unknown)') AS DatabaseName,
+        RQI.session_id AS SessionID,
+        RQI.status AS SessionStatus,
+        RQI.command,
+        RQI.wait_type AS WaitType,
+        RQI.wait_time AS WaitTimeMs,
+        RQI.wait_resource AS WaitResource,
+        RQI.blocking_session_id AS BlockingSessionID,
+        RQI.BlockingHierarchy,
+        RQI.BlockWaitTimeMs,
+        RQI.BlockWaitTime,
+        RQI.Duration AS DurationText,
+        RQI.[Duration (ms)] AS DurationMs,
+        RQI.cpu_time AS CpuTimeMs,
+        RQI.logical_reads AS LogicalReads,
+        RQI.reads,
+        RQI.writes,
+        RQI.granted_query_memory_kb AS GrantedMemoryKB,
+        RQI.open_transaction_count AS OpenTranCount,
+        RQI.transaction_duration AS TransactionDuration,
+        RQI.login_name AS LoginName,
+        RQI.host_name AS HostName,
+        RQI.program_name AS ProgramName,
+        RQI.client_interface_name AS ClientInterface,
+        RQI.query_hash AS QueryHash_SQL_ID,
+        RQI.sql_handle AS SqlHandle,
+        RQI.plan_handle AS PlanHandle,
+        RQI.text AS CurrentStatementText,
+        RQI.batch_text AS BatchText
+    FROM dbo.RunningQueriesInfo RQI
+    JOIN LatestSnapshot LS
+        ON LS.InstanceID = RQI.InstanceID
+       AND LS.SnapshotDateUTC = RQI.SnapshotDateUTC
+    WHERE
+        ISNULL(RQI.wait_time, 0) > 0
+        OR ISNULL(RQI.blocking_session_id, 0) <> 0
+        OR ISNULL(RQI.BlockCount, 0) > 0
+        OR ISNULL(RQI.BlockCountRecursive, 0) > 0
+    ORDER BY
+        RQI.wait_time DESC,
+        RQI.[Duration (ms)] DESC,
+        RQI.InstanceDisplayName,
+        DatabaseName;
+END;
+GO
+
+
+/* =========================================================
+   2) Waiting Queries Summary by Database
+   Son snapshot'taki waitleri DB bazında özetler.
+
+   Sunum için güzel:
+   "Hangi DB'de kaç bekleyen query var, toplam wait ne kadar?"
+   ========================================================= */
+
+CREATE OR ALTER PROCEDURE UserReport.Burak_09_Waiting_Queries_By_DB
+(
+    @InstanceIDs IDs READONLY
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF OBJECT_ID(N'dbo.RunningQueriesInfo', N'V') IS NULL
+    BEGIN
+        SELECT
+            'dbo.RunningQueriesInfo view bulunamadi. Running Queries collection/repository schema mevcut olmayabilir.' AS Status,
+            DB_NAME() AS RepositoryDatabaseName,
+            SYSDATETIME() AS ReportRunTime;
+        RETURN;
+    END;
+
+    ;WITH LatestSnapshot AS
+    (
+        SELECT
+            RQI.InstanceID,
+            MAX(RQI.SnapshotDateUTC) AS SnapshotDateUTC
+        FROM dbo.RunningQueriesInfo RQI
+        WHERE
+            NOT EXISTS (SELECT 1 FROM @InstanceIDs)
+            OR RQI.InstanceID IN (SELECT ID FROM @InstanceIDs)
+        GROUP BY RQI.InstanceID
+    ),
+    LatestWaiting AS
+    (
+        SELECT
+            RQI.*
+        FROM dbo.RunningQueriesInfo RQI
+        JOIN LatestSnapshot LS
+            ON LS.InstanceID = RQI.InstanceID
+           AND LS.SnapshotDateUTC = RQI.SnapshotDateUTC
+        WHERE
+            ISNULL(RQI.wait_time, 0) > 0
+            OR ISNULL(RQI.blocking_session_id, 0) <> 0
+            OR ISNULL(RQI.BlockCount, 0) > 0
+            OR ISNULL(RQI.BlockCountRecursive, 0) > 0
+    )
+    SELECT
+        InstanceDisplayName,
+        ISNULL(database_name, N'(unknown)') AS DatabaseName,
+        COUNT(*) AS WaitingQueryCount,
+        SUM(CASE WHEN ISNULL(blocking_session_id, 0) <> 0 THEN 1 ELSE 0 END) AS BlockedQueryCount,
+        SUM(CASE WHEN ISNULL(BlockCount, 0) > 0 THEN 1 ELSE 0 END) AS RootBlockerCount,
+        SUM(CAST(ISNULL(wait_time, 0) AS bigint)) AS TotalWaitTimeMs,
+        MAX(ISNULL(wait_time, 0)) AS MaxWaitTimeMs,
+        MAX([Duration (ms)]) AS MaxDurationMs,
+        SUM(CAST(ISNULL(cpu_time, 0) AS bigint)) AS TotalCpuMs,
+        SUM(CAST(ISNULL(logical_reads, 0) AS bigint)) AS TotalLogicalReads,
+        MAX(SnapshotDateUTC) AS SnapshotDateUTC
+    FROM LatestWaiting
+    GROUP BY
+        InstanceDisplayName,
+        ISNULL(database_name, N'(unknown)')
+    ORDER BY
+        TotalWaitTimeMs DESC,
+        WaitingQueryCount DESC,
+        InstanceDisplayName,
+        DatabaseName;
+END;
+GO
+
+
+/* =========================================================
+   3) Blocking Chain / Root Blocker Report
+   Son snapshot'taki blocking ilişkilerini gösterir.
+
+   Sunum için:
+   "Kim kimi blokluyor, root blocker kim?"
+   ========================================================= */
+
+CREATE OR ALTER PROCEDURE UserReport.Burak_10_Blocking_Chain_Latest
+(
+    @InstanceIDs IDs READONLY
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF OBJECT_ID(N'dbo.RunningQueriesInfo', N'V') IS NULL
+    BEGIN
+        SELECT
+            'dbo.RunningQueriesInfo view bulunamadi. Running Queries collection/repository schema mevcut olmayabilir.' AS Status,
+            DB_NAME() AS RepositoryDatabaseName,
+            SYSDATETIME() AS ReportRunTime;
+        RETURN;
+    END;
+
+    ;WITH LatestSnapshot AS
+    (
+        SELECT
+            RQI.InstanceID,
+            MAX(RQI.SnapshotDateUTC) AS SnapshotDateUTC
+        FROM dbo.RunningQueriesInfo RQI
+        WHERE
+            NOT EXISTS (SELECT 1 FROM @InstanceIDs)
+            OR RQI.InstanceID IN (SELECT ID FROM @InstanceIDs)
+        GROUP BY RQI.InstanceID
+    )
+    SELECT TOP (200)
+        RQI.InstanceDisplayName,
+        RQI.SnapshotDateUTC,
+        ISNULL(RQI.database_name, N'(unknown)') AS DatabaseName,
+        RQI.session_id AS SessionID,
+        RQI.blocking_session_id AS BlockingSessionID,
+        RQI.IsRootBlocker,
+        RQI.BlockCount,
+        RQI.BlockCountRecursive,
+        RQI.BlockWaitTimeMs,
+        RQI.BlockWaitTime,
+        RQI.BlockWaitTimeRecursiveMs,
+        RQI.BlockWaitTimeRecursive,
+        RQI.BlockingHierarchy,
+        RQI.wait_type AS WaitType,
+        RQI.wait_time AS WaitTimeMs,
+        RQI.wait_resource AS WaitResource,
+        RQI.Duration AS DurationText,
+        RQI.[Duration (ms)] AS DurationMs,
+        RQI.status AS SessionStatus,
+        RQI.command,
+        RQI.login_name AS LoginName,
+        RQI.host_name AS HostName,
+        RQI.program_name AS ProgramName,
+        RQI.query_hash AS QueryHash_SQL_ID,
+        RQI.sql_handle AS SqlHandle,
+        RQI.text AS CurrentStatementText,
+        RQI.batch_text AS BatchText
+    FROM dbo.RunningQueriesInfo RQI
+    JOIN LatestSnapshot LS
+        ON LS.InstanceID = RQI.InstanceID
+       AND LS.SnapshotDateUTC = RQI.SnapshotDateUTC
+    WHERE
+        ISNULL(RQI.blocking_session_id, 0) <> 0
+        OR ISNULL(RQI.BlockCount, 0) > 0
+        OR ISNULL(RQI.BlockCountRecursive, 0) > 0
+        OR ISNULL(RQI.IsRootBlocker, 0) = 1
+    ORDER BY
+        RQI.IsRootBlocker DESC,
+        RQI.BlockWaitTimeRecursiveMs DESC,
+        RQI.BlockCountRecursive DESC,
+        RQI.wait_time DESC;
+END;
+GO
+
+
+/* =========================================================
+   4) Waiting Query History
+   Tarih aralığına göre geçmiş bekleyen queryleri gösterir.
+   DBADash GUI bu report için FromDate / ToDate filter gösterebilir.
+
+   Default: son 24 saat.
+   ========================================================= */
+
+CREATE OR ALTER PROCEDURE UserReport.Burak_11_Waiting_Query_History
+(
+    @InstanceIDs IDs READONLY,
+    @FromDate DATETIME2 = NULL,
+    @ToDate DATETIME2 = NULL
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF OBJECT_ID(N'dbo.RunningQueriesInfo', N'V') IS NULL
+    BEGIN
+        SELECT
+            'dbo.RunningQueriesInfo view bulunamadi. Running Queries collection/repository schema mevcut olmayabilir.' AS Status,
+            DB_NAME() AS RepositoryDatabaseName,
+            SYSDATETIME() AS ReportRunTime;
+        RETURN;
+    END;
+
+    SET @ToDate = ISNULL(@ToDate, SYSUTCDATETIME());
+    SET @FromDate = ISNULL(@FromDate, DATEADD(HOUR, -24, @ToDate));
+
+    SELECT TOP (500)
+        RQI.InstanceDisplayName,
+        RQI.SnapshotDateUTC,
+        ISNULL(RQI.database_name, N'(unknown)') AS DatabaseName,
+        RQI.session_id AS SessionID,
+        RQI.status AS SessionStatus,
+        RQI.command,
+        RQI.wait_type AS WaitType,
+        RQI.wait_time AS WaitTimeMs,
+        RQI.wait_resource AS WaitResource,
+        RQI.blocking_session_id AS BlockingSessionID,
+        RQI.BlockingHierarchy,
+        RQI.Duration AS DurationText,
+        RQI.[Duration (ms)] AS DurationMs,
+        RQI.cpu_time AS CpuTimeMs,
+        RQI.logical_reads AS LogicalReads,
+        RQI.reads,
+        RQI.writes,
+        RQI.login_name AS LoginName,
+        RQI.host_name AS HostName,
+        RQI.program_name AS ProgramName,
+        RQI.query_hash AS QueryHash_SQL_ID,
+        RQI.sql_handle AS SqlHandle,
+        RQI.text AS CurrentStatementText,
+        RQI.batch_text AS BatchText
+    FROM dbo.RunningQueriesInfo RQI
+    WHERE
+        RQI.SnapshotDateUTC >= @FromDate
+        AND RQI.SnapshotDateUTC < @ToDate
+        AND
+        (
+            NOT EXISTS (SELECT 1 FROM @InstanceIDs)
+            OR RQI.InstanceID IN (SELECT ID FROM @InstanceIDs)
+        )
+        AND
+        (
+            ISNULL(RQI.wait_time, 0) > 0
+            OR ISNULL(RQI.blocking_session_id, 0) <> 0
+            OR ISNULL(RQI.BlockCount, 0) > 0
+            OR ISNULL(RQI.BlockCountRecursive, 0) > 0
+        )
+    ORDER BY
+        RQI.SnapshotDateUTC DESC,
+        RQI.wait_time DESC,
+        RQI.[Duration (ms)] DESC;
+END;
+GO
+
+
+/* =========================================================
+   5) Top Wait Types by DB - History
+   Geçmiş snapshotlardan DB + wait_type bazlı özet çıkarır.
+
+   Default: son 24 saat.
+   ========================================================= */
+
+CREATE OR ALTER PROCEDURE UserReport.Burak_12_Top_Wait_Types_By_DB
+(
+    @InstanceIDs IDs READONLY,
+    @FromDate DATETIME2 = NULL,
+    @ToDate DATETIME2 = NULL
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF OBJECT_ID(N'dbo.RunningQueriesInfo', N'V') IS NULL
+    BEGIN
+        SELECT
+            'dbo.RunningQueriesInfo view bulunamadi. Running Queries collection/repository schema mevcut olmayabilir.' AS Status,
+            DB_NAME() AS RepositoryDatabaseName,
+            SYSDATETIME() AS ReportRunTime;
+        RETURN;
+    END;
+
+    SET @ToDate = ISNULL(@ToDate, SYSUTCDATETIME());
+    SET @FromDate = ISNULL(@FromDate, DATEADD(HOUR, -24, @ToDate));
+
+    SELECT TOP (200)
+        RQI.InstanceDisplayName,
+        ISNULL(RQI.database_name, N'(unknown)') AS DatabaseName,
+        ISNULL(RQI.wait_type, N'(no wait type)') AS WaitType,
+        COUNT(*) AS SampleCount,
+        COUNT(DISTINCT RQI.session_id) AS DistinctSessionCount,
+        SUM(CAST(ISNULL(RQI.wait_time, 0) AS bigint)) AS TotalWaitTimeMs,
+        MAX(ISNULL(RQI.wait_time, 0)) AS MaxWaitTimeMs,
+        AVG(CAST(ISNULL(RQI.wait_time, 0) AS bigint)) AS AvgWaitTimeMs,
+        MAX(RQI.[Duration (ms)]) AS MaxDurationMs,
+        MIN(RQI.SnapshotDateUTC) AS FirstSeenUTC,
+        MAX(RQI.SnapshotDateUTC) AS LastSeenUTC
+    FROM dbo.RunningQueriesInfo RQI
+    WHERE
+        RQI.SnapshotDateUTC >= @FromDate
+        AND RQI.SnapshotDateUTC < @ToDate
+        AND
+        (
+            NOT EXISTS (SELECT 1 FROM @InstanceIDs)
+            OR RQI.InstanceID IN (SELECT ID FROM @InstanceIDs)
+        )
+        AND ISNULL(RQI.wait_time, 0) > 0
+    GROUP BY
+        RQI.InstanceDisplayName,
+        ISNULL(RQI.database_name, N'(unknown)'),
+        ISNULL(RQI.wait_type, N'(no wait type)')
+    ORDER BY
+        TotalWaitTimeMs DESC,
+        SampleCount DESC;
+END;
+GO
+
+
+/* =========================================================
+   6) Yetki
+   ========================================================= */
+
+IF DATABASE_PRINCIPAL_ID(N'RunUserReports') IS NOT NULL
+BEGIN
+    GRANT EXECUTE ON SCHEMA::UserReport TO RunUserReports;
+END
+GO
+
+
+/* =========================================================
+   7) Kontrol
+   ========================================================= */
 
 SELECT
     s.name AS SchemaName,
@@ -56,5 +443,8 @@ FROM sys.procedures p
 JOIN sys.schemas s
     ON s.schema_id = p.schema_id
 WHERE s.name = N'UserReport'
+  AND p.name LIKE N'Burak_0[8-9]%'
+   OR s.name = N'UserReport'
+  AND p.name LIKE N'Burak_1[0-2]%'
 ORDER BY p.name;
 GO
