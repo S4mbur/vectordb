@@ -1,0 +1,27 @@
+# Milvus connection
+MILVUS_HOST=127.0.0.1
+MILVUS_PORT=19530
+MILVUS_COLLECTION=ai_docs_milvus
+
+# Start safely with FLAT. Change to HNSW or IVF_FLAT only after basic upload works.
+MILVUS_INDEX_TYPE=FLAT
+MILVUS_INSERT_BATCH_SIZE=32
+
+# RPC timeouts
+MILVUS_OPERATION_TIMEOUT=120
+MILVUS_INDEX_TIMEOUT=300
+MILVUS_FLUSH_TIMEOUT=180
+
+# The first upload always performs one flush before first index creation.
+# This flag controls extra flushes after later uploads.
+MILVUS_FLUSH_AFTER_UPLOAD=false
+MILVUS_CONSISTENCY_LEVEL=Strong
+
+# UI diagnostics are hidden unless enabled.
+MILVUS_DETAILED_PROGRESS=true
+MILVUS_DIAGNOSTICS_ENABLED=true
+
+# App
+APP_HOST=0.0.0.0
+APP_PORT=8080
+APP_LOG_LEVEL=info
