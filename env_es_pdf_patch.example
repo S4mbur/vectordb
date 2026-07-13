@@ -1,0 +1,31 @@
+# PDF extraction (faster than pypdf, preserves page-aware chunking)
+PDF_EXTRACTOR=pymupdf
+PDF_TEXT_SORT=true
+PDF_FALLBACK_TO_PYPDF=true
+
+# Existing chunk structure
+CHUNK_MAX_WORDS=450
+CHUNK_OVERLAP_WORDS=80
+CHUNK_MIN_WORDS=20
+
+# Embedding API batches
+EMBEDDING_BATCH_SIZE=8
+
+# Elasticsearch
+ES_URL=http://127.0.0.1:9200
+ES_INDEX=ai_docs_elasticsearch
+ES_REQUEST_TIMEOUT=120
+
+# Bounded-memory bulk indexing
+ES_BULK_CHUNK_SIZE=16
+ES_BULK_MAX_CHUNK_BYTES=5242880
+ES_BULK_MAX_RETRIES=5
+ES_BULK_INITIAL_BACKOFF=1
+ES_BULK_MAX_BACKOFF=30
+ES_REFRESH_AFTER_UPLOAD=true
+ES_STOP_ON_BATCH_ERROR=true
+ES_ERROR_SAMPLE_LIMIT=5
+
+APP_HOST=0.0.0.0
+APP_PORT=8080
+APP_LOG_LEVEL=info
